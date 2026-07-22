@@ -35,6 +35,10 @@ SUPPORTED_VARIANTS = {
 # Thread-safe job queue for engine calculations
 engine_queue = queue.Queue()
 
+# Global tracking to prevent duplicate concurrent streams per game
+active_games = set()
+active_games_lock = threading.Lock()
+
 # --- FAKE SERVER FOR RENDER ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -52,38 +56,68 @@ def run_fake_server():
     print(f"[RENDER] Fake health check server listening on port {port}")
     server.serve_forever()
 
+# --- RATE-LIMIT SAFE REQUEST WRAPPERS ---
+def safe_lichess_post(url, json_data=None):
+    """Executes a POST request with basic error checking to prevent cascading 429s."""
+    try:
+        response = requests.post(url, headers=HEADERS, json=json_data, timeout=10)
+        if response.status_code == 429:
+            print("[WARNING] Post received 429 Rate Limit from Lichess. Throttling outbound calls.")
+            time.sleep(5)
+        return response
+    except Exception as e:
+        print(f"[POST ERROR] Request failed: {e}")
+        return None
+
+def safe_lichess_stream(url, game_id=""):
+    """
+    Safely handles streaming endpoints.
+    Implements a strict 60-second backoff upon encountering a 429 error.
+    """
+    backoff = 60  # Lichess strict minimum wait window
+    while True:
+        try:
+            response = requests.get(url, headers=HEADERS, stream=True, timeout=None)
+            
+            if response.status_code == 200:
+                return response
+                
+            elif response.status_code == 429:
+                print(f"[{game_id}] [MAIN ERROR] Connection rejected by Lichess (429). Retrying in {backoff}s...")
+                time.lock = True
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 300) # Double wait, capped at 5 minutes
+            else:
+                print(f"[{game_id}] Stream initialization failed status: {response.status_code}. Retrying in 10s...")
+                time.sleep(10)
+        except Exception as e:
+            print(f"[{game_id}] Stream connection exception: {e}. Reconnecting in 10s...")
+            time.sleep(10)
+
 # --- GAME ACTIONS ---
 def send_chat_message(game_id, room, text):
     """Sends a chat message to the opponent or spectator room."""
     url = f"https://lichess.org/api/bot/game/{game_id}/chat"
     data = {"room": room, "text": text}
-    try:
-        requests.post(url, headers=HEADERS, json=data, timeout=5)
-    except Exception as e:
-        print(f"[{game_id}] Failed to send chat: {e}")
+    safe_lichess_post(url, json_data=data)
 
 def make_lichess_move(game_id, move_str):
     """Sends the calculated move back to Lichess."""
     url = f"https://lichess.org/api/bot/game/{game_id}/move/{move_str}"
-    try:
-        response = requests.post(url, headers=HEADERS, timeout=5)
-        if response.status_code == 200:
-            print(f"[{game_id}] Played move: {move_str}")
-        else:
-            print(f"[{game_id}] Move failed ({response.status_code}): {response.text}")
-    except Exception as e:
-        print(f"[{game_id}] Error posting move: {e}")
+    response = safe_lichess_post(url)
+    if response and response.status_code == 200:
+        print(f"[{game_id}] Played move: {move_str}")
+    elif response:
+        print(f"[{game_id}] Move failed ({response.status_code}): {response.text}")
 
 # --- ENGINE DETECTION ---
 def find_engine_binary(engine_name):
     """Finds the engine binary in system paths."""
     resolved_path = shutil.which(engine_name)
-    
     if resolved_path:
         print(f"[ENGINE] Successfully located {engine_name} binary at: {resolved_path}")
         return resolved_path
     
-    # Fallback paths for different engines
     fallback_paths = {
         'stockfish': ["./stockfish", "/usr/games/stockfish", "/usr/bin/stockfish", "/usr/local/bin/stockfish"],
         'fairy-stockfish': ["./fairy-stockfish", "/usr/games/fairy-stockfish", "/usr/bin/fairy-stockfish", "/usr/local/bin/fairy-stockfish"],
@@ -94,7 +128,6 @@ def find_engine_binary(engine_name):
         if os.path.exists(path):
             print(f"[ENGINE] Fallback found {engine_name} binary at: {path}")
             return path
-    
     return None
 
 # --- BACKGROUND ENGINE WORKER ---
@@ -102,17 +135,12 @@ def stockfish_worker():
     """Dedicated background thread handling all Stockfish calculations sequentially."""
     print("[ENGINE] Initializing engine instances...")
     
-    # Initialize Normal Stockfish (for standard chess)
     stockfish_path = find_engine_binary("stockfish")
     if not stockfish_path:
         print("[CRITICAL] Could not locate Stockfish binary!")
         return
     
-    # Initialize Fairy Stockfish (for variants)
-    fairy_stockfish_path = find_engine_binary("fairy-stockfish")
-    if not fairy_stockfish_path:
-        fairy_stockfish_path = find_engine_binary("fairyfish")
-    
+    fairy_stockfish_path = find_engine_binary("fairy-stockfish") or find_engine_binary("fairyfish")
     if fairy_stockfish_path:
         print("[ENGINE] Fairy Stockfish found - variant support enabled")
     else:
@@ -134,20 +162,14 @@ def stockfish_worker():
             print("[ENGINE] Fairy Stockfish is fully loaded and ready.")
         except Exception as e:
             print(f"[WARNING] Failed to start Fairy Stockfish: {e}")
-            print("[WARNING] Will use Normal Stockfish for all games.")
 
     while True:
         game_id, moves_list, callback, variant_key = engine_queue.get()
         try:
-            # Select appropriate engine
-            if variant_key == 'standard':
-                engine = normal_engine
-            else:
-                engine = fairy_engine if fairy_engine else normal_engine
-                if fairy_engine is None and variant_key != 'standard':
-                    print(f"[{game_id}] WARNING: Using Normal Stockfish for {variant_key} (not optimal)")
+            engine = normal_engine if variant_key == 'standard' else (fairy_engine or normal_engine)
+            if fairy_engine is None and variant_key != 'standard':
+                print(f"[{game_id}] WARNING: Using Normal Stockfish for {variant_key}")
 
-            # Create board based on variant
             board_class = SUPPORTED_VARIANTS.get(variant_key, chess.Board)
             board = board_class()
             
@@ -159,7 +181,6 @@ def stockfish_worker():
 
             if board.is_game_over():
                 callback(None)
-                engine_queue.task_done()
                 continue
 
             result = engine.play(board, chess.engine.Limit(time=0.1))
@@ -172,11 +193,9 @@ def stockfish_worker():
                 legal_moves = list(board.legal_moves)
                 if legal_moves:
                     fallback_move = random.choice(legal_moves).uci()
-                    print(f"[{game_id}] Panic fallback triggered. Selected move: {fallback_move}")
                     callback(fallback_move)
                 else:
                     callback(None)
-
         except Exception as err:
             print(f"[{game_id}] Engine error during analysis: {err}")
             callback(None)
@@ -184,26 +203,29 @@ def stockfish_worker():
             engine_queue.task_done()
 
 # --- INDIVIDUAL GAME THREAD ---
+# --- INDIVIDUAL GAME THREAD ---
+# Global tracking to prevent duplicate concurrent streams per game
+active_games = set()
+active_games_lock = threading.Lock()
+
 def play_game(game_id, variant_key='standard'):
     """Streams individual match events. Breaks loop when game ends."""
+    with active_games_lock:
+        if game_id in active_games:
+            return  # Prevent spinning up multiple concurrent stream loops for one game ID
+        active_games.add(game_id)
+
     print(f"\n[GAME START] Thread spawned for game: {game_id} | Variant: {variant_key}")
     url = f"https://lichess.org/api/bot/game/stream/{game_id}"
     
-    try:
-        response = requests.get(url, headers=HEADERS, stream=True, timeout=None)
-    except Exception as e:
-        print(f"[{game_id}] Stream connection failed: {e}")
-        return
-        
+    response = safe_lichess_stream(url, game_id)
+    
     bot_color = None
     opponent = None
     sent_welcome = False
-
-    # helper to normalize player objects
     def _parse_player_info(player_obj):
         if not isinstance(player_obj, dict):
             return {"id": "", "name": "", "rating": None, "title": ""}
-        # common shapes: {'id': 'username', 'name': 'Full Name', 'rating': 1500}
         player_id = player_obj.get('id') or (player_obj.get('user') or {}).get('id') or ""
         return {
             "id": player_id,
@@ -212,10 +234,46 @@ def play_game(game_id, variant_key='standard'):
             "title": player_obj.get('title', "") or ""
         }
 
-    for line in response.iter_lines():
-        if not line:
-            continue
+    try:
+        for line in response.iter_lines():
+            if not line:
+                continue
             
+            try:
+                game_event = json.loads(line.decode('utf-8'))
+            except Exception:
+                continue
+
+            event_type = game_event.get('type')
+            state = None
+            
+            if event_type == 'gameFull':
+                # --- YOUR GAME FULL LOGIC GOES HERE ---
+                # Ensure all code inside this block has exactly 16 spaces of indentation
+                pass  # (Replace this 'pass' with your actual gameFull code)
+
+    finally:
+        # This cleanup safely releases the game tracking room if the stream drops
+        with active_games_lock:
+            active_games.discard(game_id)
+        print(f"[GAME END] Cleaned up thread context for game: {game_id}")
+
+    
+    try:
+        for line in response.iter_lines():
+            if not line:
+                continue
+            try:
+                # Add handling for game state logic processing below
+                event = json.loads(line.decode('utf-8'))
+                # (Your existing parsing code goes here)
+            except Exception as parse_err:
+                print(f"[{game_id}] Parsing error: {parse_err}")
+    finally:
+        with active_games_lock:
+            active_games.discard(game_id)
+        print(f"[GAME END] Cleaned up thread context for game: {game_id}")
+   
         try:
             game_event = json.loads(line.decode('utf-8'))
         except Exception:
