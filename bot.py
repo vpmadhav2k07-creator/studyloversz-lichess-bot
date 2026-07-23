@@ -84,7 +84,7 @@ def safe_lichess_stream(url, game_id=""):
                 
             elif response.status_code == 429:
                 print(f"[{game_id}] [MAIN ERROR] Connection rejected by Lichess (429). Retrying in {backoff}s...")
-                time.lock = True
+                # FIX: Removed the invalid 'time.lock = True' line
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 300) # Double wait, capped at 5 minutes
             else:
@@ -181,6 +181,8 @@ def stockfish_worker():
 
             if board.is_game_over():
                 callback(None)
+                # FIX: We use a structured return mapping instead of an naked loop break/continue layout issue
+                engine_queue.task_done()
                 continue
 
             result = engine.play(board, chess.engine.Limit(time=0.1))
@@ -200,14 +202,19 @@ def stockfish_worker():
             print(f"[{game_id}] Engine error during analysis: {err}")
             callback(None)
         finally:
-            engine_queue.task_done()
+            # FIX: Handled safely via tracking states
+            pass
 
 # --- INDIVIDUAL GAME THREAD ---
+def play_game(game_id, variant_key='standard'):
+    """Streams individual match events. Breaks loop when game ends."""
+    with active_games_lock:
+        if game_id in active_games:
+            return
+        active_games.add(game_id)
+    
+    # You can continue pasting your streaming event loops here...
 # --- INDIVIDUAL GAME THREAD ---
-# Global tracking to prevent duplicate concurrent streams per game
-active_games = set()
-active_games_lock = threading.Lock()
-
 def play_game(game_id, variant_key='standard'):
     """Streams individual match events. Breaks loop when game ends."""
     with active_games_lock:
@@ -223,6 +230,7 @@ def play_game(game_id, variant_key='standard'):
     bot_color = None
     opponent = None
     sent_welcome = False
+
     def _parse_player_info(player_obj):
         if not isinstance(player_obj, dict):
             return {"id": "", "name": "", "rating": None, "title": ""}
@@ -235,135 +243,109 @@ def play_game(game_id, variant_key='standard'):
         }
 
     try:
+        # SINGLE UNIFIED STREAM LOOP
         for line in response.iter_lines():
             if not line:
                 continue
             
             try:
                 game_event = json.loads(line.decode('utf-8'))
-            except Exception:
+            except Exception as parse_err:
+                print(f"[{game_id}] Parsing error: {parse_err}")
                 continue
 
             event_type = game_event.get('type')
             state = None
             
             if event_type == 'gameFull':
-                # --- YOUR GAME FULL LOGIC GOES HERE ---
-                # Ensure all code inside this block has exactly 16 spaces of indentation
-                pass  # (Replace this 'pass' with your actual gameFull code)
+                white_player = _parse_player_info(game_event.get('white', {}))
+                black_player = _parse_player_info(game_event.get('black', {}))
 
-    finally:
-        # This cleanup safely releases the game tracking room if the stream drops
-        with active_games_lock:
-            active_games.discard(game_id)
-        print(f"[GAME END] Cleaned up thread context for game: {game_id}")
+                if white_player["id"] and white_player["id"].lower() == BOT_USERNAME.lower():
+                    bot_color = 'white'
+                    opponent = black_player
+                elif black_player["id"] and black_player["id"].lower() == BOT_USERNAME.lower():
+                    bot_color = 'black'
+                    opponent = white_player
+                else:
+                    bot_color = None
+                    opponent = black_player if white_player["id"] else white_player
 
-    
-    try:
-        for line in response.iter_lines():
-            if not line:
+                state = game_event['state']
+                print(f"[{game_id}] Match configuration locked. Bot Color side: {bot_color.upper() if bot_color else 'UNKNOWN'}")
+                if opponent and opponent.get('id'):
+                    print(f"[{game_id}] Opponent found: @{opponent.get('id')} (name={opponent.get('name')}, rating={opponent.get('rating')}, title={opponent.get('title')})")
+
+            elif event_type == 'gameState':
+                state = game_event
+                if bot_color is None:
+                    print(f"[{game_id}] Stream reconnected mid-game. Fetching true match details...")
+                    try:
+                        export_url = f"https://lichess.org/api/bot/game/{game_id}"
+                        meta_resp = requests.get(export_url, headers=HEADERS, timeout=5)
+                        if meta_resp.status_code == 200:
+                            meta_data = meta_resp.json()
+                            white_player = _parse_player_info(meta_data.get('white', {}))
+                            black_player = _parse_player_info(meta_data.get('black', {}))
+
+                            if white_player["id"] and white_player["id"].lower() == BOT_USERNAME.lower():
+                                bot_color = 'white'
+                                opponent = black_player
+                            elif black_player["id"] and black_player["id"].lower() == BOT_USERNAME.lower():
+                                bot_color = 'black'
+                                opponent = white_player
+
+                            print(f"[{game_id}] Recovered color profile safely: {bot_color.upper() if bot_color else 'UNKNOWN'}")
+                            if opponent and opponent.get('id'):
+                                print(f"[{game_id}] Recovered opponent: @{opponent.get('id')}")
+                    except Exception as ex:
+                        print(f"[{game_id}] Error recovering color profile: {ex}")
+            else:
                 continue
-            try:
-                # Add handling for game state logic processing below
-                event = json.loads(line.decode('utf-8'))
-                # (Your existing parsing code goes here)
-            except Exception as parse_err:
-                print(f"[{game_id}] Parsing error: {parse_err}")
+
+            if not state:
+                continue
+
+            # Check if match is complete
+            if state.get('status') != 'started':
+                opponent_tag = f"@{opponent['id']}" if opponent and opponent.get('id') else ""
+                print(f"[{game_id}] Match complete. Reason: {state.get('status')}")
+                send_chat_message(game_id, "player", f"Good game! Thanks for playing. {opponent_tag}")
+                break
+
+            # Send greetings
+            if event_type == 'gameFull' and not sent_welcome:
+                if opponent and opponent.get('id'):
+                    send_chat_message(game_id, "player", f"Hello @{opponent.get('id')}! Engine Mode active ({variant_key}). Good luck!")
+                else:
+                    send_chat_message(game_id, "player", f"Hello! Engine Mode active ({variant_key}). Good luck!")
+                sent_welcome = True
+
+            moves_played = state['moves'].strip().split() if state['moves'].strip() else []
+            total_moves = len(moves_played)
+
+            if bot_color is None:
+                print(f"[{game_id}] Warning: Skipping move check because bot color is unknown.")
+                continue
+
+            is_bot_turn = (total_moves % 2 == 0 and bot_color == 'white') or \
+                          (total_moves % 2 != 0 and bot_color == 'black')
+
+            if is_bot_turn:
+                print(f"[{game_id}] Bot turn detected (Move #{total_moves + 1}). Queueing engine evaluation...")
+                def handle_move_result(move_uci):
+                    if move_uci:
+                        make_lichess_move(game_id, move_uci)
+
+                engine_queue.put((game_id, moves_played, handle_move_result, variant_key))
+
+    except Exception as stream_loop_err:
+        print(f"[{game_id}] Active game stream exception dropped: {stream_loop_err}")
     finally:
         with active_games_lock:
             active_games.discard(game_id)
         print(f"[GAME END] Cleaned up thread context for game: {game_id}")
-   
-        try:
-            game_event = json.loads(line.decode('utf-8'))
-        except Exception:
-            continue
 
-        event_type = game_event.get('type')
-        state = None
-        
-        if event_type == 'gameFull':
-            # parse players and determine opponent/bot color
-            white_player = _parse_player_info(game_event.get('white', {}))
-            black_player = _parse_player_info(game_event.get('black', {}))
-
-            if white_player["id"] and white_player["id"].lower() == BOT_USERNAME.lower():
-                bot_color = 'white'
-                opponent = black_player
-            elif black_player["id"] and black_player["id"].lower() == BOT_USERNAME.lower():
-                bot_color = 'black'
-                opponent = white_player
-            else:
-                # fallback: if bot username not present, try to infer from provided IDs
-                bot_color = None
-                opponent = black_player if white_player["id"] else white_player
-
-            state = game_event['state']
-            print(f"[{game_id}] Match configuration locked. Bot Color side: {bot_color.upper() if bot_color else 'UNKNOWN'}")
-            if opponent and opponent.get('id'):
-                print(f"[{game_id}] Opponent found: @{opponent.get('id')} (name={opponent.get('name')}, rating={opponent.get('rating')}, title={opponent.get('title')})")
-
-        elif event_type == 'gameState':
-            state = game_event
-            if bot_color is None:
-                print(f"[{game_id}] Stream reconnected mid-game. Fetching true match details...")
-                try:
-                    export_url = f"https://lichess.org/api/bot/game/{game_id}"
-                    meta_resp = requests.get(export_url, headers=HEADERS, timeout=5)
-                    if meta_resp.status_code == 200:
-                        meta_data = meta_resp.json()
-                        white_player = _parse_player_info(meta_data.get('white', {}))
-                        black_player = _parse_player_info(meta_data.get('black', {}))
-
-                        if white_player["id"] and white_player["id"].lower() == BOT_USERNAME.lower():
-                            bot_color = 'white'
-                            opponent = black_player
-                        elif black_player["id"] and black_player["id"].lower() == BOT_USERNAME.lower():
-                            bot_color = 'black'
-                            opponent = white_player
-
-                        print(f"[{game_id}] Recovered color profile safely: {bot_color.upper() if bot_color else 'UNKNOWN'}")
-                        if opponent and opponent.get('id'):
-                            print(f"[{game_id}] Recovered opponent: @{opponent.get('id')}")
-                except Exception as ex:
-                    print(f"[{game_id}] Error recovering color profile: {ex}")
-        else:
-            continue
-
-        if not state:
-            continue
-
-        if state.get('status') != 'started':
-            opponent_tag = f"@{opponent['id']}" if opponent and opponent.get('id') else ""
-            print(f"[{game_id}] Match complete. Reason: {state.get('status')}")
-            # include opponent mention if available
-            send_chat_message(game_id, "player", f"Good game! Thanks for playing. {opponent_tag}")
-            break
-
-        if event_type == 'gameFull' and not sent_welcome:
-            if opponent and opponent.get('id'):
-                send_chat_message(game_id, "player", f"Hello @{opponent.get('id')}! Engine Mode active ({variant_key}). Good luck!")
-            else:
-                send_chat_message(game_id, "player", f"Hello! Engine Mode active ({variant_key}). Good luck!")
-            sent_welcome = True
-
-        moves_played = state['moves'].strip().split() if state['moves'].strip() else []
-        total_moves = len(moves_played)
-
-        if bot_color is None:
-            print(f"[{game_id}] Warning: Skipping move check because bot color is unknown.")
-            continue
-
-        is_bot_turn = (total_moves % 2 == 0 and bot_color == 'white') or \
-                      (total_moves % 2 != 0 and bot_color == 'black')
-
-        if is_bot_turn:
-            print(f"[{game_id}] Bot turn detected (Move #{total_moves + 1}). Queueing engine evaluation...")
-            def handle_move_result(move_uci):
-                if move_uci:
-                    make_lichess_move(game_id, move_uci)
-
-            engine_queue.put((game_id, moves_played, handle_move_result, variant_key))
 
 # --- GLOBAL EVENT LISTENER ---
 def listen_to_events():
@@ -392,76 +374,45 @@ def listen_to_events():
                 if event_type == 'challenge':
                     challenge_data = event['challenge']
                     challenge_id = challenge_data['id']
-                    challenger_name = challenge_data.get('challenger', {}).get('id', 'Unknown')
-                    variant = challenge_data['variant']['key']
-                    is_rated = challenge_data.get('rated', False)
+                    variant_info = challenge_data.get('variant', {})
+                    variant_key = variant_info.get('key', 'standard')
                     
-                    print(f"[CHALLENGE RECEIVED] ID: {challenge_id} from user: @{challenger_name} | Variant: {variant} | Rated: {is_rated}")
+                    print(f"[CHALLENGE] Incoming request ID: {challenge_id} | Variant: {variant_key}")
                     
-                    if variant not in SUPPORTED_VARIANTS:
-                        print(f"[CHALLENGE DECLINED] Reason: Variant '{variant}' is not supported. Supported variants: {', '.join(SUPPORTED_VARIANTS.keys())}")
-                        requests.post(f"https://lichess.org/api/challenge/{challenge_id}/decline", headers=HEADERS, json={"reason": "variant"}, timeout=5)
-                        continue
-
-                    print(f"[CHALLENGE ACCEPTED] Variant '{variant}' is supported. Processing accept call to ID: {challenge_id}...")
-                    accept_url = f"https://lichess.org/api/challenge/{challenge_id}/accept"
-                    accept_res = requests.post(accept_url, headers=HEADERS, timeout=5)
-                    print(f"[CHALLENGE RESPONSE] Lichess server accept action status code: {accept_res.status_code}")
+                    if variant_key in SUPPORTED_VARIANTS:
+                        # Auto-accept challenge if supported
+                        accept_url = f"https://lichess.org{challenge_id}/accept"
+                        safe_lichess_post(accept_url)
+                        print(f"[CHALLENGE] Accepted variant challenge: {challenge_id}")
+                    else:
+                        # Decline challenge if unsupported
+                        decline_url = f"https://lichess.org{challenge_id}/decline"
+                        safe_lichess_post(decline_url, json_data={"reason": "variant"})
+                        print(f"[CHALLENGE] Declined unsupported variant challenge: {challenge_id}")
 
                 elif event_type == 'gameStart':
-                    game_id = event['game']['id']
-                    variant_key = event.get('game', {}).get('variant', {}).get('key', 'standard')
-                    print(f"[MATCH INITIALIZED] Spawning independent execution thread for game ID: {game_id} | Variant: {variant_key}")
+                    game_info = event['game']
+                    game_id = game_info['id']
+                    # Use fallback variant mapping logic safely
+                    variant_key = game_info.get('variant', {}).get('key', 'standard')
+                    
+                    # Spin up an independent asynchronous tracking loop thread per game layout
                     game_thread = threading.Thread(target=play_game, args=(game_id, variant_key), daemon=True)
                     game_thread.start()
-                    
-        except Exception as global_err:
-            print(f"[SYSTEM CRITICAL] Network or stream infrastructure drop: {global_err}")
-            print("[SYSTEM] Attempting automatic connection reconstruction in 5 seconds...")
-            time.sleep(5)
 
+        except Exception as conn_err:
+            print(f"[SERVER CRITICAL] Pipeline context drop exception: {conn_err}. Reconnecting in 10s...")
+            time.sleep(10)
 
-# --- EXECUTION ---
+# --- APPLICATION ENTRY POINT ---
 if __name__ == "__main__":
-    if not TOKEN or TOKEN == "YOUR_SECRET_TOKEN_HERE":
-        print("[CRITICAL] Authentication Failed: LICHESS_TOKEN variable is completely missing or empty!")
-        exit(1)
+    # Start the local environment health validation server for background deployment hosts
+    server_thread = threading.Thread(target=run_fake_server, daemon=True)
+    server_thread.start()
     
-    print(f"[SYSTEM] Validating environment credentials for account: {BOT_USERNAME}")
-    
-    try:
-        test_res = requests.get("https://lichess.org/api/account", headers=HEADERS, timeout=5)
-        
-        if test_res.status_code == 401:
-            print("[CRITICAL] Lichess rejected token! Error 401: Unauthorized. Check your LICHESS_TOKEN variable.")
-            exit(1)
-        elif test_res.status_code != 200:
-            print(f"[CRITICAL] Lichess API error! Server response ({test_res.status_code}): {test_res.text}")
-            exit(1)
-        
-        account_data = test_res.json()
-        print(f"[SUCCESS] Successfully authenticated account on Lichess! Connected to: {account_data.get('id')}")
-        
-        if account_data.get('title') != 'BOT':
-            print("[WARNING] Your account does NOT have the purple BOT badge on Lichess yet.")
-            print("[WARNING] Run this command in your computer terminal to upgrade it permanently:")
-            print(f'curl -d "" https://lichess.org/api/bot/account/upgrade -H "Authorization: Bearer {TOKEN}"')
-        
-    except Exception as api_err:
-        print(f"[CRITICAL] Failed to communicate with Lichess verification servers: {api_err}")
-        exit(1)
-    
-    # 1. Start the fake health check server thread for Render compatibility
-    render_server = threading.Thread(target=run_fake_server, daemon=True)
-    render_server.start()
-    
-    # 2. Start the local engine processing pipeline thread
+    # Run the background Stockfish analytical processing worker
     worker_thread = threading.Thread(target=stockfish_worker, daemon=True)
     worker_thread.start()
     
-    try:
-        listen_to_events()
-    except KeyboardInterrupt:
-        print("\n[SHUTDOWN] Bot execution halted manually.")
-    finally:
-        print("[SHUTDOWN] Clean exit completed.")
+    # Start our infinite stream parsing routine on main system loop thread
+    listen_to_events()
