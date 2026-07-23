@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: Invictus-Knight-Bot
+    name: Studyloversz-bot 
     dockerfilePath: ./Dockerfile
     autoDeploy: true
     envVars:
