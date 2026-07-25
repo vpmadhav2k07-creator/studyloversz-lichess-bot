@@ -17,7 +17,7 @@ RUN apt-get update && apt-get install -y \
 # Clone, compile, and install Fairy-Stockfish from source securely
 ENV REPO_OWNER="fairy-stockfish"
 ENV REPO_NAME="Fairy-Stockfish"
-RUN git clone https://github.com/{REPO_OWNER}/${REPO_NAME}.git /tmp/fairy-stockfish \
+RUN git clone https://github.com/${REPO_OWNER}/${REPO_NAME}.git /tmp/fairy-stockfish \
     && cd /tmp/fairy-stockfish/src \
     && make -j$(nproc) build ARCH=x86-64 \
     && cp stockfish /usr/local/bin/fairy-stockfish \
