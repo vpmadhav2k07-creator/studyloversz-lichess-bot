@@ -206,14 +206,7 @@ def stockfish_worker():
             pass
 
 # --- INDIVIDUAL GAME THREAD ---
-def play_game(game_id, variant_key='standard'):
-    """Streams individual match events. Breaks loop when game ends."""
-    with active_games_lock:
-        if game_id in active_games:
-            return
-        active_games.add(game_id)
-    
-    # You can continue pasting your streaming event loops here...
+
 # --- INDIVIDUAL GAME THREAD ---
 def play_game(game_id, variant_key='standard'):
     """Streams individual match events. Breaks loop when game ends."""
