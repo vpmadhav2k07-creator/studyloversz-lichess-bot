@@ -61,9 +61,16 @@ def safe_lichess_post(url, json_data=None):
     """Executes a POST request with basic error checking to prevent cascading 429s."""
     try:
         response = requests.post(url, headers=HEADERS, json=json_data, timeout=10)
+        
+        # Add tracking for rate limits
         if response.status_code == 429:
             print("[WARNING] Post received 429 Rate Limit from Lichess. Throttling outbound calls.")
             time.sleep(5)
+            
+        # FIX: Check if status code is anything other than a successful 200 OK
+        elif response.status_code != 200:
+            print(f"[POST FAILURE] URL: {url} | Status: {response.status_code} | Response: {response.text}")
+            
         return response
     except Exception as e:
         print(f"[POST ERROR] Request failed: {e}")
