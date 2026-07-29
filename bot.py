@@ -217,11 +217,9 @@ def stockfish_worker():
 # --- INDIVIDUAL GAME THREAD ---
 def play_game(game_id, variant_key='standard'):
     """Streams individual match events. Breaks loop when game ends."""
+    print(f"[THREAD DEBUG] play_game thread entered for {game_id}") # ADD THIS
     with active_games_lock:
-        if game_id in active_games:
-            return  # Prevent spinning up multiple concurrent stream loops for one game ID
-        active_games.add(game_id)
-
+        # ... rest of your code
     print(f"\n[GAME START] Thread spawned for game: {game_id} | Variant: {variant_key}")
     url = f"https://lichess.org/api/bot/game/stream/{game_id}"
     
