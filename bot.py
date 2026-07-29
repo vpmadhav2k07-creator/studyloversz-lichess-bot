@@ -364,46 +364,50 @@ def listen_to_events():
             response = requests.get(url, headers=HEADERS, stream=True, timeout=None)
             print("[SERVER] Stream connection successfully established with Lichess pipelines.")
             
-            for line in response.iter_lines():
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line.decode('utf-8'))
-                except Exception as parse_err:
-                    print(f"[STREAM ERROR] Failed to parse stream line data: {parse_err}")
-                    continue
+for line in response.iter_lines():
+    if not line:
+        continue
+    try:
+        event = json.loads(line.decode('utf-8'))
+    except Exception as parse_err:
+        print(f"[STREAM ERROR] Failed to parse stream line data: {parse_err}")
+        continue
 
-                event_type = event.get('type')
-                print(f"[STREAM EVENT] Received incoming packet notification type: '{event_type}'")
+    event_type = event.get('type')
+    print(f"[STREAM EVENT] Received incoming packet notification type: '{event_type}'")
 
-                if event_type == 'challenge':
-                    challenge_data = event['challenge']
-                    challenge_id = challenge_data['id']
-                    variant_info = challenge_data.get('variant', {})
-                    variant_key = variant_info.get('key', 'standard')
-                    
-                    print(f"[CHALLENGE] Incoming request ID: {challenge_id} | Variant: {variant_key}")
-                    
-                    if variant_key in SUPPORTED_VARIANTS:
-                        # Auto-accept challenge if supported
-                        accept_url = f"https://lichess.org/api/bot/challenge/{challenge_id}/accept"
-                        safe_lichess_post(accept_url)
-                        print(f"[CHALLENGE] Accepted variant challenge: {challenge_id}")
-                    else:
-                        # Decline challenge if unsupported
-                        decline_url = f"https://lichess.org/api/bot/challenge/{challenge_id}/decline"
-                        safe_lichess_post(decline_url, json_data={"reason": "variant"})
-                        print(f"[CHALLENGE] Declined unsupported variant challenge: {challenge_id}")
+    # --- OUTER EVENT TYPE CHECK ---
+    if event_type == 'challenge':
+        challenge_data = event['challenge']
+        challenge_id = challenge_data['id']
+        variant_info = challenge_data.get('variant', {})
+        variant_key = variant_info.get('key', 'standard')
+        
+        print(f"[CHALLENGE] Incoming request ID: {challenge_id} | Variant: {variant_key}")
+        
+        if variant_key in SUPPORTED_VARIANTS:
+            # Auto-accept challenge if supported
+            accept_url = f"https://lichess.org/api/bot/challenge/{challenge_id}/accept"
+            safe_lichess_post(accept_url)
+            print(f"[CHALLENGE] Accepted variant challenge: {challenge_id}")
+        else:
+            # Decline challenge if unsupported
+            decline_url = f"https://lichess.org/api/bot/challenge/{challenge_id}/decline"
+            safe_lichess_post(decline_url, json_data={"reason": "variant"})
+            print(f"[CHALLENGE] Declined unsupported variant challenge: {challenge_id}")
 
-                elif event_type == 'gameStart':
-                    game_info = event['game']
-                    game_id = game_info['id']
-                    # Use fallback variant mapping logic safely
-                    variant_key = game_info.get('variant', {}).get('key', 'standard')
-                    
-                    # Spin up an independent asynchronous tracking loop thread per game layout
-                    game_thread = threading.Thread(target=play_game, args=(game_id, variant_key), daemon=True)
-                    game_thread.start()
+    # --- FIXED: Aligned properly with 'if event_type == challenge' ---
+    elif event_type == 'gameStart':
+        game_info = event['game']
+        game_id = game_info['id']
+        variant_key = game_info.get('variant', {}).get('key', 'standard')
+        
+        print(f"[GAME DETECTED] Initializing game loop for ID: {game_id}")
+        
+        # Spin up an independent thread per game
+        game_thread = threading.Thread(target=play_game, args=(game_id, variant_key), daemon=True)
+        game_thread.start()
+
 
         except Exception as conn_err:
             print(f"[SERVER CRITICAL] Pipeline context drop exception: {conn_err}. Reconnecting in 10s...")
