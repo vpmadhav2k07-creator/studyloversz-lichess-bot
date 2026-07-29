@@ -374,12 +374,12 @@ def listen_to_events():
                     
                     if variant_key in SUPPORTED_VARIANTS:
                         # Auto-accept challenge if supported
-                        accept_url = f"https://lichess.org{challenge_id}/accept"
+                        accept_url = f"https://lichess.org/api/bot/challenge/{challenge_id}/accept"
                         safe_lichess_post(accept_url)
                         print(f"[CHALLENGE] Accepted variant challenge: {challenge_id}")
                     else:
                         # Decline challenge if unsupported
-                        decline_url = f"https://lichess.org{challenge_id}/decline"
+                        decline_url = f"https://lichess.org/api/bot/challenge/{challenge_id}/decline"
                         safe_lichess_post(decline_url, json_data={"reason": "variant"})
                         print(f"[CHALLENGE] Declined unsupported variant challenge: {challenge_id}")
 
