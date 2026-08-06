@@ -14,13 +14,19 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # --- CONFIGURATION ---
 TOKEN = os.environ.get("LICHESS_TOKEN", "YOUR_SECRET_TOKEN_HERE")
 BOT_USERNAME = "Studyloversz-bot"
+BOT_USERNAME_LC = BOT_USERNAME.lower()
 
 HEADERS = {
     "Authorization": f"Bearer {TOKEN}",
-    "Content-Type": "application/json"
+    "Content-Type": "application/json",
+    "User-Agent": f"{BOT_USERNAME}/1.0 (+https://lichess.org/@/{BOT_USERNAME_LC})"
 }
 
-# Supported variants mapping
+# Fail fast if token not provided
+if not TOKEN or TOKEN == "YOUR_SECRET_TOKEN_HERE":
+    print("[FATAL] LICHESS_TOKEN not set. Set LICHESS_TOKEN env var and restart.")
+    raise SystemExit(1)
+
 SUPPORTED_VARIANTS = {
     'standard': chess.Board,
     'antichess': chess.variant.AntichessBoard,
@@ -32,10 +38,7 @@ SUPPORTED_VARIANTS = {
     'threecheck': chess.variant.ThreeCheckBoard,
 }
 
-# Thread-safe job queue for engine calculations
 engine_queue = queue.Queue()
-
-# Global tracking to prevent duplicate concurrent streams per game
 active_games = set()
 active_games_lock = threading.Lock()
 
@@ -48,7 +51,8 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Lichess Bot & Fake Server are fully active!")
 
     def log_message(self, format, *args):
-        return  # Suppress internal server logs to keep console clean
+        return
+
 
 def run_fake_server():
     port = int(os.environ.get("PORT", 8080))
@@ -56,60 +60,51 @@ def run_fake_server():
     print(f"[RENDER] Fake health check server listening on port {port}")
     server.serve_forever()
 
-# --- RATE-LIMIT SAFE REQUEST WRAPPERS ---
+# --- SAFE REQUESTS ---
 def safe_lichess_post(url, json_data=None):
-    """Executes a POST request with basic error checking to prevent cascading 429s."""
     try:
         response = requests.post(url, headers=HEADERS, json=json_data, timeout=10)
-        
-        # Add tracking for rate limits
         if response.status_code == 429:
-            print("[WARNING] Post received 429 Rate Limit from Lichess. Throttling outbound calls.")
+            print("[WARNING] 429 Rate Limit. Backing off...")
             time.sleep(5)
-            
-        # FIX: Check if status code is anything other than a successful 200 OK
-        elif response.status_code != 200:
-            print(f"[POST FAILURE] URL: {url} | Status: {response.status_code} | Response: {response.text}")
-            
+        if not response.ok:
+            print(f"[POST ERROR] {response.status_code}: {response.text}")
         return response
     except Exception as e:
-        print(f"[POST ERROR] Request failed: {e}")
+        print(f"[POST ERROR] {e}")
         return None
 
+
 def safe_lichess_stream(url, game_id=""):
-    """
-    Safely handles streaming endpoints.
-    Implements a strict 60-second backoff upon encountering a 429 error.
-    """
-    backoff = 60  # Lichess strict minimum wait window
+    backoff = 5
     while True:
         try:
             response = requests.get(url, headers=HEADERS, stream=True, timeout=None)
-            
             if response.status_code == 200:
                 return response
-                
             elif response.status_code == 429:
-                print(f"[{game_id}] [MAIN ERROR] Connection rejected by Lichess (429). Retrying in {backoff}s...")
-                # FIX: Removed the invalid 'time.lock = True' line
+                print(f"[{game_id}] 429 error. Retrying in {backoff}s...")
                 time.sleep(backoff)
-                backoff = min(backoff * 2, 300) # Double wait, capped at 5 minutes
+                backoff = min(backoff * 2, 300)
             else:
-                print(f"[{game_id}] Stream initialization failed status: {response.status_code}. Retrying in 10s...")
+                print(f"[{game_id}] Stream failed ({response.status_code}). Retrying in 10s...")
                 time.sleep(10)
         except Exception as e:
-            print(f"[{game_id}] Stream connection exception: {e}. Reconnecting in 10s...")
-            time.sleep(10)
+            print(f"[{game_id}] Stream exception: {e}. Retrying in 5s...")
+            time.sleep(5)
 
 # --- GAME ACTIONS ---
 def send_chat_message(game_id, room, text):
-    """Sends a chat message to the opponent or spectator room."""
     url = f"https://lichess.org/api/bot/game/{game_id}/chat"
     data = {"room": room, "text": text}
-    safe_lichess_post(url, json_data=data)
+    response = safe_lichess_post(url, json_data=data)
+    if response and response.status_code == 200:
+        print(f"[{game_id}] Chat message sent: {text}")
+    else:
+        print(f"[{game_id}] Failed to send chat: {response.status_code if response else 'No response'}")
+
 
 def make_lichess_move(game_id, move_str):
-    """Sends the calculated move back to Lichess."""
     url = f"https://lichess.org/api/bot/game/{game_id}/move/{move_str}"
     response = safe_lichess_post(url)
     if response and response.status_code == 200:
@@ -117,48 +112,34 @@ def make_lichess_move(game_id, move_str):
     elif response:
         print(f"[{game_id}] Move failed ({response.status_code}): {response.text}")
 
-# --- ENGINE DETECTION ---
+# --- ENGINE ---
 def find_engine_binary(engine_name):
-    """Finds the engine binary in system paths."""
     resolved_path = shutil.which(engine_name)
     if resolved_path:
-        print(f"[ENGINE] Successfully located {engine_name} binary at: {resolved_path}")
         return resolved_path
-    
     fallback_paths = {
-        'stockfish': ["./stockfish", "/usr/games/stockfish", "/usr/bin/stockfish", "/usr/local/bin/stockfish"],
-        'fairy-stockfish': ["./fairy-stockfish", "/usr/games/fairy-stockfish", "/usr/bin/fairy-stockfish", "/usr/local/bin/fairy-stockfish"],
-        'fairyfish': ["./fairyfish", "/usr/games/fairyfish", "/usr/bin/fairyfish", "/usr/local/bin/fairyfish"]
+        'stockfish': ["/usr/games/stockfish", "/usr/bin/stockfish", "/usr/local/bin/stockfish"],
+        'fairy-stockfish': ["/usr/local/bin/fairy-stockfish"],
     }
-    
     for path in fallback_paths.get(engine_name, []):
         if os.path.exists(path):
-            print(f"[ENGINE] Fallback found {engine_name} binary at: {path}")
             return path
     return None
 
-# --- BACKGROUND ENGINE WORKER ---
+
 def stockfish_worker():
-    """Dedicated background thread handling all Stockfish calculations sequentially."""
-    print("[ENGINE] Initializing engine instances...")
-    
+    print("[ENGINE] Initializing...")
     stockfish_path = find_engine_binary("stockfish")
     if not stockfish_path:
-        print("[CRITICAL] Could not locate Stockfish binary!")
+        print("[CRITICAL] Stockfish not found!")
         return
-    
-    fairy_stockfish_path = find_engine_binary("fairy-stockfish") or find_engine_binary("fairyfish")
-    if fairy_stockfish_path:
-        print("[ENGINE] Fairy Stockfish found - variant support enabled")
-    else:
-        print("[WARNING] Fairy Stockfish not found - only standard chess will be optimal")
 
+    fairy_stockfish_path = find_engine_binary("fairy-stockfish")
     try:
         normal_engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
         normal_engine.configure({"Skill Level": 20, "Hash": 64, "Threads": 1})
-        print("[ENGINE] Normal Stockfish is fully loaded and ready.")
     except Exception as e:
-        print(f"[CRITICAL] Failed to start Normal Stockfish: {e}")
+        print(f"[CRITICAL] Failed to start Stockfish: {e}")
         return
 
     fairy_engine = None
@@ -166,7 +147,6 @@ def stockfish_worker():
         try:
             fairy_engine = chess.engine.SimpleEngine.popen_uci(fairy_stockfish_path)
             fairy_engine.configure({"Skill Level": 20, "Hash": 64, "Threads": 1})
-            print("[ENGINE] Fairy Stockfish is fully loaded and ready.")
         except Exception as e:
             print(f"[WARNING] Failed to start Fairy Stockfish: {e}")
 
@@ -174,12 +154,8 @@ def stockfish_worker():
         game_id, moves_list, callback, variant_key = engine_queue.get()
         try:
             engine = normal_engine if variant_key == 'standard' else (fairy_engine or normal_engine)
-            if fairy_engine is None and variant_key != 'standard':
-                print(f"[{game_id}] WARNING: Using Normal Stockfish for {variant_key}")
-
             board_class = SUPPORTED_VARIANTS.get(variant_key, chess.Board)
             board = board_class()
-            
             for move in moves_list:
                 try:
                     board.push_uci(move)
@@ -188,218 +164,205 @@ def stockfish_worker():
 
             if board.is_game_over():
                 callback(None)
-                # FIX: We use a structured return mapping instead of an naked loop break/continue layout issue
-                engine_queue.task_done()
-                continue
-
-            result = engine.play(board, chess.engine.Limit(time=0.1))
-            best_move = result.move
-
-            if best_move and board.is_legal(best_move):
-                print(f"[{game_id}] Engine generated valid move: {best_move.uci()}")
-                callback(best_move.uci())
             else:
-                legal_moves = list(board.legal_moves)
-                if legal_moves:
-                    fallback_move = random.choice(legal_moves).uci()
-                    callback(fallback_move)
+                result = engine.play(board, chess.engine.Limit(time=0.1))
+                best_move = result.move
+                if best_move and board.is_legal(best_move):
+                    callback(best_move.uci())
                 else:
-                    callback(None)
+                    legal_moves = list(board.legal_moves)
+                    callback(random.choice(legal_moves).uci() if legal_moves else None)
         except Exception as err:
-            print(f"[{game_id}] Engine error during analysis: {err}")
+            print(f"[{game_id}] Engine error: {err}")
             callback(None)
         finally:
-            # FIX: Handled safely via tracking states
-            pass
+            engine_queue.task_done()
 
-# --- INDIVIDUAL GAME THREAD ---
 
-# --- INDIVIDUAL GAME THREAD ---
-def play_game(game_id, variant_key='standard'):
-    """Streams individual match events. Breaks loop when game ends."""
-    print(f"[THREAD DEBUG] play_game thread entered for {game_id}")
-    
-    with active_games_lock:
-        if game_id in active_games:
-            print(f"[THREAD DEBUG] Game {game_id} already active! Aborting duplicate thread.")
-            return  
-        active_games.add(game_id)
-
-    print(f"\n[GAME START] Thread spawned for game: {game_id} | Variant: {variant_key}")
-    url = f"https://lichess.org/api/bot/game/stream/{game_id}"
-    
-    # ... rest of your stream loop logic goes here
-    
-    response = safe_lichess_stream(url, game_id)
-    
-    bot_color = None
-    opponent = None
-    sent_welcome = False
-
-    def _parse_player_info(player_obj):
-        if not isinstance(player_obj, dict):
-            return {"id": "", "name": "", "rating": None, "title": ""}
-        player_id = player_obj.get('id') or (player_obj.get('user') or {}).get('id') or ""
-        return {
-            "id": player_id,
-            "name": player_obj.get('name', "") or "",
-            "rating": player_obj.get('rating'),
-            "title": player_obj.get('title', "") or ""
-        }
-
+def play_game(game_id, variant_key):
     try:
-        # SINGLE UNIFIED STREAM LOOP
+        print(f"[GAME START] {game_id} | Variant: {variant_key}")
+        moves_played = []
+        bot_color = None
+        opening_move_played = False
+
+        game_url = f"https://lichess.org/api/bot/game/stream/{game_id}"
+        response = safe_lichess_stream(game_url, game_id)
+
         for line in response.iter_lines():
             if not line:
                 continue
-            
             try:
-                game_event = json.loads(line.decode('utf-8'))
+                event = json.loads(line.decode('utf-8'))
             except Exception as parse_err:
-                print(f"[{game_id}] Parsing error: {parse_err}")
+                print(f"[STREAM ERROR] Failed to parse: {parse_err}")
                 continue
 
-            event_type = game_event.get('type')
-            state = None
-            
+            event_type = event.get('type')
+
             if event_type == 'gameFull':
-                white_player = _parse_player_info(game_event.get('white', {}))
-                black_player = _parse_player_info(game_event.get('black', {}))
+                state = event.get('state', {})
+                moves_str = state.get('moves', '')
+                moves_played = moves_str.split() if moves_str else []
 
-                if white_player["id"] and white_player["id"].lower() == BOT_USERNAME.lower():
+                # Determine bot color - check both white and black
+                white_id = (event.get('white') or {}).get('id', '') or ''
+                black_id = (event.get('black') or {}).get('id', '') or ''
+
+                if white_id and white_id.lower() == BOT_USERNAME_LC:
                     bot_color = 'white'
-                    opponent = black_player
-                elif black_player["id"] and black_player["id"].lower() == BOT_USERNAME.lower():
+                elif black_id and black_id.lower() == BOT_USERNAME_LC:
                     bot_color = 'black'
-                    opponent = white_player
                 else:
-                    bot_color = None
-                    opponent = black_player if white_player["id"] else white_player
+                    print(f"[{game_id}] ERROR: Bot not found in game! White: {white_id}, Black: {black_id}")
+                    # If bot not in game, ensure we remove from active_games so it can be retried later
+                    with active_games_lock:
+                        active_games.discard(game_id)
+                    continue
 
-                state = game_event['state']
-                print(f"[{game_id}] Match configuration locked. Bot Color side: {bot_color.upper() if bot_color else 'UNKNOWN'}")
-                if opponent and opponent.get('id'):
-                    print(f"[{game_id}] Opponent found: @{opponent.get('id')} (name={opponent.get('name')}, rating={opponent.get('rating')}, title={opponent.get('title')})")
+                print(f"[GAME INFO] Bot plays as {bot_color}")
+
+                # Send opening greeting
+                send_chat_message(game_id, 'player', 'Hello! Good luck!')
+
+                if bot_color == 'white' and len(moves_played) == 0 and not opening_move_played:
+                    print(f"[{game_id}] Bot is White — making opening move...")
+                    opening_move_played = True
+
+                    def handle_move_result(move_uci):
+                        if move_uci:
+                            make_lichess_move(game_id, move_uci)
+
+                    engine_queue.put((game_id, moves_played, handle_move_result, variant_key))
 
             elif event_type == 'gameState':
-                state = game_event
+                # If we haven't determined bot_color yet, skip gameState updates
                 if bot_color is None:
-                    print(f"[{game_id}] Stream reconnected mid-game. Fetching true match details...")
-                    try:
-                        export_url = f"https://lichess.org/api/bot/game/{game_id}"
-                        meta_resp = requests.get(export_url, headers=HEADERS, timeout=5)
-                        if meta_resp.status_code == 200:
-                            meta_data = meta_resp.json()
-                            white_player = _parse_player_info(meta_data.get('white', {}))
-                            black_player = _parse_player_info(meta_data.get('black', {}))
+                    continue
 
-                            if white_player["id"] and white_player["id"].lower() == BOT_USERNAME.lower():
-                                bot_color = 'white'
-                                opponent = black_player
-                            elif black_player["id"] and black_player["id"].lower() == BOT_USERNAME.lower():
-                                bot_color = 'black'
-                                opponent = white_player
+                moves_str = event.get('moves', '')
+                moves_played = moves_str.split() if moves_str else []
+                is_bot_turn = (
+                    (len(moves_played) % 2 == 0 and bot_color == 'white') or
+                    (len(moves_played) % 2 == 1 and bot_color == 'black')
+                )
 
-                            print(f"[{game_id}] Recovered color profile safely: {bot_color.upper() if bot_color else 'UNKNOWN'}")
-                            if opponent and opponent.get('id'):
-                                print(f"[{game_id}] Recovered opponent: @{opponent.get('id')}")
-                    except Exception as ex:
-                        print(f"[{game_id}] Error recovering color profile: {ex}")
-            else:
-                continue
+                if is_bot_turn:
+                    print(f"[{game_id}] Bot turn detected ({bot_color}), moves so far: {len(moves_played)}")
 
-            if not state:
-                continue
+                    def handle_move_result(move_uci):
+                        if move_uci:
+                            make_lichess_move(game_id, move_uci)
 
-            # Check if match is complete
-            if state.get('status') != 'started':
-                opponent_tag = f"@{opponent['id']}" if opponent and opponent.get('id') else ""
-                print(f"[{game_id}] Match complete. Reason: {state.get('status')}")
-                send_chat_message(game_id, "player", f"Good game! Thanks for playing. {opponent_tag}")
-                break
+                    engine_queue.put((game_id, moves_played, handle_move_result, variant_key))
 
-            # Send greetings
-            if event_type == 'gameFull' and not sent_welcome:
-                if opponent and opponent.get('id'):
-                    send_chat_message(game_id, "player", f"Hello @{opponent.get('id')}! Engine Mode active ({variant_key}). Good luck!")
-                else:
-                    send_chat_message(game_id, "player", f"Hello! Engine Mode active ({variant_key}). Good luck!")
-                sent_welcome = True
+    except Exception as conn_err:
+        print(f"[SERVER CRITICAL] {conn_err}. Reconnecting in 10s...")
+        time.sleep(10)
 
-            moves_played = state['moves'].strip().split() if state['moves'].strip() else []
-            total_moves = len(moves_played)
-
-            if bot_color is None:
-                print(f"[{game_id}] Warning: Skipping move check because bot color is unknown.")
-                continue
-
-            is_bot_turn = (total_moves % 2 == 0 and bot_color == 'white') or \
-                          (total_moves % 2 != 0 and bot_color == 'black')
-
-            if is_bot_turn:
-                print(f"[{game_id}] Bot turn detected (Move #{total_moves + 1}). Queueing engine evaluation...")
-                def handle_move_result(move_uci):
-                    if move_uci:
-                        make_lichess_move(game_id, move_uci)
-
-                engine_queue.put((game_id, moves_played, handle_move_result, variant_key))
-
-    except Exception as stream_loop_err:
-        print(f"[{game_id}] Active game stream exception dropped: {stream_loop_err}")
     finally:
         with active_games_lock:
             active_games.discard(game_id)
-        print(f"[GAME END] Cleaned up thread context for game: {game_id}")
+        print(f"[GAME END] {game_id}")
 
 
-# --- GLOBAL EVENT LISTENER ---
+def handle_challenge(event):
+    try:
+        challenge = event.get('challenge', {})
+        challenge_id = challenge.get('id')
+        challenger = challenge.get('challenger', {})
+        challenger_id = challenger.get('id', '')
+        challenger_name = challenger.get('name', challenger_id or 'Unknown')
+        challenger_is_bot = challenger.get('bot', False)
+        variant = challenge.get('variant', {}).get('key', 'unknown')
+        speed = challenge.get('timeControl', {}).get('type', 'unknown')
+        rated = challenge.get('rated', False)
+
+        # Fallback heuristic if 'bot' flag is missing/unreliable
+        heuristic_bot = False
+        if not challenger_is_bot and challenger_id:
+            heuristic_bot = 'bot' in challenger_id.lower()
+            challenger_is_bot = challenger_is_bot or heuristic_bot
+
+        print(f"[CHALLENGE] Received from {challenger_name} id={challenger_id} (bot_flag={challenger.get('bot', None)} heuristic={heuristic_bot}) ({variant}, {speed}, {'rated' if rated else 'casual'})")
+
+        # Decline challenges from known/heuristic bots
+        if challenger_is_bot:
+            print(f"[CHALLENGE] Declining challenge from bot: {challenger_name} ({challenger_id})")
+            url = f"https://lichess.org/api/challenge/{challenge_id}/decline"
+            safe_lichess_post(url)
+            return
+
+        # Accept all challenges from humans
+        print(f"[CHALLENGE] Accepting challenge from {challenger_name} ({challenger_id})")
+        url = f"https://lichess.org/api/challenge/{challenge_id}/accept"
+        response = safe_lichess_post(url)
+        if response and response.status_code == 200:
+            print(f"[CHALLENGE] Successfully accepted challenge from {challenger_name}")
+        else:
+            print(f"[CHALLENGE ERROR] Failed to accept challenge: {response.status_code if response else 'No response'}")
+            if response:
+                print(f"[CHALLENGE ERROR] Response: {response.text}")
+    except Exception as e:
+        print(f"[CHALLENGE ERROR] Exception in handle_challenge: {e}")
+
+# --- GLOBAL LISTENER ---
 def listen_to_events():
-    print(f"Starting global event listener for user: {BOT_USERNAME}")
+    print("[SERVER] Connecting to Lichess event stream...")
     url = "https://lichess.org/api/stream/event"
+
     while True:
         try:
-            response = requests.get(url, headers=HEADERS, stream=True, timeout=None)
-            print("[SERVER] Stream connection established.")
+            response = safe_lichess_stream(url, "events")
+            print("[SERVER] Connected to Lichess event stream.")
+
             for line in response.iter_lines():
                 if not line:
                     continue
-                try:
-                    event = json.loads(line.decode('utf-8'))
-                except Exception as parse_err:
-                    print(f"[STREAM ERROR] Parse failed: {parse_err}")
+                decoded_line = line.decode('utf-8').strip()
+                if not decoded_line:
                     continue
-                event_type = event.get('type')
-                if event_type == 'challenge':
-                    challenge_data = event['challenge']
-                    challenge_id = challenge_data['id']
-                    variant_key = challenge_data.get('variant', {}).get('key', 'standard')
-                    if variant_key in SUPPORTED_VARIANTS:
-                        accept_url = f"https://lichess.org/api/bot/challenge/{challenge_id}/accept"
-                        safe_lichess_post(accept_url)
-                        print(f"[CHALLENGE] Accepted challenge: {challenge_id}")
-                    else:
-                        decline_url = f"https://lichess.org/api/bot/challenge/{challenge_id}/decline"
-                        safe_lichess_post(decline_url, json_data={"reason": "variant"})
-                elif event_type == 'gameStart':
-                    game_info = event['game']
-                    game_id = game_info['id']
-                    variant_key = game_info.get('variant', {}).get('key', 'standard')
-                    print(f"[GAME DETECTED] Spawning loop for ID: {game_id}")
-                    game_thread = threading.Thread(target=play_game, args=(game_id, variant_key), daemon=True)
-                    game_thread.start()
-        except Exception as conn_err:
-            print(f"[SERVER CRITICAL] Drop error: {conn_err}. Reconnecting...")
-            time.sleep(10)
+                try:
+                    event = json.loads(decoded_line)
+                except json.JSONDecodeError:
+                    # Ignore malformed or heartbeat lines silently
+                    continue
 
-# --- APPLICATION ENTRY POINT ---
+                event_type = event.get('type')
+                print(f"[STREAM EVENT] Received: {event_type}")
+
+                if event_type == 'challenge':
+                    handle_challenge(event)
+                elif event_type == 'gameStart':
+                    game_id = event['game']['id']
+                    variant_key = event['game']['variant']['key']
+                    with active_games_lock:
+                        if game_id in active_games:
+                            print(f"[{game_id}] Already handling game, skipping duplicate gameStart")
+                            continue
+                        active_games.add(game_id)
+                    t = threading.Thread(target=play_game, args=(game_id, variant_key), daemon=True)
+                    t.start()
+
+        except Exception as conn_err:
+            print(f"[SERVER CRITICAL] {conn_err}. Reconnecting in 10s...")
+            time.sleep(10)
+            continue
+
+# --- ENTRY POINT ---
 if __name__ == "__main__":
-    # Start the local environment health validation server for background deployment hosts
-    server_thread = threading.Thread(target=run_fake_server, daemon=True)
-    server_thread.start()
-    
-    # Run the background Stockfish analytical processing worker
-    worker_thread = threading.Thread(target=stockfish_worker, daemon=True)
-    worker_thread.start()
-    
-    # Start our infinite stream parsing routine on main system loop thread
-    listen_to_events()
+    try:
+        # Start the fake server for Render health checks
+        server_thread = threading.Thread(target=run_fake_server, daemon=True)
+        server_thread.start()
+
+        # Start the Stockfish worker thread
+        worker_thread = threading.Thread(target=stockfish_worker, daemon=True)
+        worker_thread.start()
+
+        # Start listening to Lichess events
+        listen_to_events()
+    except Exception as e:
+        print(f"[FATAL] Bot crashed: {e}")
+        while True:
+            time.sleep(60)
