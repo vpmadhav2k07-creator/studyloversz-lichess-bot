@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: AATK_VanguardX
+    name: Studyloversz-bot 
     dockerfilePath: ./Dockerfile
     autoDeploy: true
     envVars:
