@@ -63,7 +63,13 @@ def run_fake_server():
 # --- SAFE REQUESTS ---
 def safe_lichess_post(url, json_data=None):
     try:
-        response = requests.post(url, headers=HEADERS, json=json_data, timeout=10)
+        # Some Lichess endpoints expect an empty POST with no JSON body (accept/decline).
+        # requests.post(..., json=None) still sends a `null` body; call without json when json_data is None.
+        if json_data is None:
+            response = requests.post(url, headers=HEADERS, timeout=10)
+        else:
+            response = requests.post(url, headers=HEADERS, json=json_data, timeout=10)
+
         if response.status_code == 429:
             print("[WARNING] 429 Rate Limit. Backing off...")
             time.sleep(5)
@@ -282,18 +288,21 @@ def handle_challenge(event):
         heuristic_bot = False
         if not challenger_is_bot and challenger_id:
             heuristic_bot = 'bot' in challenger_id.lower()
-            challenger_is_bot = challenger_is_bot or heuristic_bot
 
-        print(f"[CHALLENGE] Received from {challenger_name} id={challenger_id} (bot_flag={challenger.get('bot', None)} heuristic={heuristic_bot}) ({variant}, {speed}, {'rated' if rated else 'casual'})")
+        print(f"[CHALLENGE] Received from {challenger_name} id={challenger_id} (bot_flag={challenger.get('bot', None)} heuristic={heuristic_bot}) ({variant}, {speed}, {'rated' if rated else 'casual'})[...]")
 
-        # Decline challenges from known/heuristic bots
+        # Decline only if Lichess explicitly marks challenger as a bot
         if challenger_is_bot:
             print(f"[CHALLENGE] Declining challenge from bot: {challenger_name} ({challenger_id})")
             url = f"https://lichess.org/api/challenge/{challenge_id}/decline"
             safe_lichess_post(url)
             return
 
-        # Accept all challenges from humans
+        # If heuristic suspects 'bot' in the id, log it but do not decline automatically
+        if heuristic_bot:
+            print(f"[CHALLENGE] Heuristic indicates challenger id contains 'bot' but challenger flag is not set; accepting: {challenger_id}")
+
+        # Accept all challenges from humans (or ambiguous cases)
         print(f"[CHALLENGE] Accepting challenge from {challenger_name} ({challenger_id})")
         url = f"https://lichess.org/api/challenge/{challenge_id}/accept"
         response = safe_lichess_post(url)
