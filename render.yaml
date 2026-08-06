@@ -1,11 +1,12 @@
 services:
   - type: web
-    name: Studyloversz-bot 
+    name: AATK_VanguardX
     dockerfilePath: ./Dockerfile
     autoDeploy: true
     envVars:
       - key: LICHESS_TOKEN
-        scope: project
+        sync: false   # keep secret safe, set value in Render dashboard
       - key: PORT
         value: "8080"
     region: oregon
+    plan: free        # or starter/standard depending on your Render plan
