@@ -1,39 +1,35 @@
+# Dockerfile for studyloversz-lichess-bot
 FROM python:3.11-slim
 
-WORKDIR /app
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV LICHHESS_TOKEN=${LICHHESS_TOKEN:-YOUR_SECRET_TOKEN_HERE}
 
-# Install Stockfish and system tools
-RUN apt-get update && apt-get install -y \
-    stockfish \
-    wget \
-    git \
-    build-essential \
-    python3-dev \
+# Install system deps and Stockfish engine
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      ca-certificates \
+      stockfish \
     && rm -rf /var/lib/apt/lists/*
 
-# Clone, compile, and install Fairy-Stockfish
-ENV REPO_OWNER="fairy-stockfish"
-ENV REPO_NAME="Fairy-Stockfish"
-RUN git clone https://github.com/${REPO_OWNER}/${REPO_NAME}.git /tmp/fairy-stockfish \
-    && cd /tmp/fairy-stockfish/src \
-    && make -j$(nproc) build ARCH=x86-64 \
-    && cp stockfish /usr/local/bin/fairy-stockfish \
-    && rm -rf /tmp/fairy-stockfish
+# Create app directory
+WORKDIR /app
+COPY . /app
 
-# Copy requirements
-COPY requirements.txt .
+# Install Python deps: prefer requirements.txt if present
+RUN if [ -f requirements.txt ]; then \
+      pip install --no-cache-dir -r requirements.txt ; \
+    else \
+      pip install --no-cache-dir python-chess requests ; \
+    fi
 
-# Upgrade pip tools first
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel
-
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy bot code
-COPY bot.py .
-
-# Expose health check port
+# Expose port for health check
 EXPOSE 8080
 
-# Run bot
+# Optional environment tuning - adjust these for stronger play
+ENV SF_THREADS=${SF_THREADS:-2}
+ENV SF_HASH=${SF_HASH:-128}
+ENV SF_THINK_TIME=${SF_THINK_TIME:-0.5}
+ENV SF_SKILL_LEVEL=${SF_SKILL_LEVEL:-20}
+
 CMD ["python", "bot.py"]

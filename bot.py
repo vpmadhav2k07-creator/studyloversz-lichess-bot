@@ -114,9 +114,29 @@ def make_lichess_move(game_id, move_str):
 
 # --- ENGINE ---
 def find_engine_binary(engine_name):
-    resolved_path = shutil.which(engine_name)
-    if resolved_path:
-        return resolved_path
+    # Allow override via env var for testing or custom engine path
+    env_path = os.environ.get("ENGINE_PATH")
+    if env_path and os.path.exists(env_path):
+        return env_path
+
+    # Try common binary names and locations
+    candidates = [
+        engine_name,
+        "stockfish",
+        "stockfish_16",
+        "stockfish_15",
+        "/usr/local/bin/stockfish",
+        "/usr/bin/stockfish",
+        "/usr/games/stockfish",
+    ]
+    for candidate in candidates:
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+        if os.path.exists(candidate):
+            return candidate
+
+    # fallback map for special engines
     fallback_paths = {
         'stockfish': ["/usr/games/stockfish", "/usr/bin/stockfish", "/usr/local/bin/stockfish"],
         'fairy-stockfish': ["/usr/local/bin/fairy-stockfish"],
@@ -128,55 +148,106 @@ def find_engine_binary(engine_name):
 
 
 def stockfish_worker():
-    print("[ENGINE] Initializing...")
+    print("[ENGINE] Initializing strong engine worker...")
+
+    # Configurable parameters via env vars
+    sf_threads = int(os.environ.get("SF_THREADS", os.cpu_count() or 1))
+    sf_hash = int(os.environ.get("SF_HASH", 128))  # MB
+    sf_think_time = float(os.environ.get("SF_THINK_TIME", 0.5))  # seconds per move target
+    sf_skill = int(os.environ.get("SF_SKILL_LEVEL", 20))
+
     stockfish_path = find_engine_binary("stockfish")
     if not stockfish_path:
-        print("[CRITICAL] Stockfish not found!")
+        print("[CRITICAL] Stockfish not found! Please install stockfish in the container or set ENGINE_PATH.")
         return
 
     fairy_stockfish_path = find_engine_binary("fairy-stockfish")
+
+    normal_engine = None
+    fairy_engine = None
     try:
         normal_engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
-        normal_engine.configure({"Skill Level": 20, "Hash": 64, "Threads": 1})
+        try:
+            normal_engine.configure({"Skill Level": sf_skill, "Hash": sf_hash, "Threads": sf_threads})
+        except Exception:
+            # Different engine builds may use different option names
+            try:
+                normal_engine.configure({"Threads": sf_threads, "Hash": sf_hash})
+            except Exception:
+                pass
+        print(f"[ENGINE] Stockfish started ({stockfish_path}) threads={sf_threads} hash={sf_hash}MB")
     except Exception as e:
         print(f"[CRITICAL] Failed to start Stockfish: {e}")
+        if normal_engine:
+            try:
+                normal_engine.quit()
+            except Exception:
+                pass
         return
 
-    fairy_engine = None
     if fairy_stockfish_path:
         try:
             fairy_engine = chess.engine.SimpleEngine.popen_uci(fairy_stockfish_path)
-            fairy_engine.configure({"Skill Level": 20, "Hash": 64, "Threads": 1})
+            try:
+                fairy_engine.configure({"Skill Level": sf_skill, "Hash": sf_hash, "Threads": sf_threads})
+            except Exception:
+                pass
+            print(f"[ENGINE] Fairy Stockfish started ({fairy_stockfish_path})")
         except Exception as e:
             print(f"[WARNING] Failed to start Fairy Stockfish: {e}")
+            fairy_engine = None
 
-    while True:
-        game_id, moves_list, callback, variant_key = engine_queue.get()
-        try:
-            engine = normal_engine if variant_key == 'standard' else (fairy_engine or normal_engine)
-            board_class = SUPPORTED_VARIANTS.get(variant_key, chess.Board)
-            board = board_class()
-            for move in moves_list:
-                try:
-                    board.push_uci(move)
-                except Exception:
-                    pass
+    try:
+        while True:
+            game_id, moves_list, callback, variant_key = engine_queue.get()
+            try:
+                engine = normal_engine if variant_key == 'standard' else (fairy_engine or normal_engine)
+                board_class = SUPPORTED_VARIANTS.get(variant_key, chess.Board)
+                board = board_class()
+                for move in moves_list:
+                    try:
+                        board.push_uci(move)
+                    except Exception:
+                        pass
 
-            if board.is_game_over():
-                callback(None)
-            else:
-                result = engine.play(board, chess.engine.Limit(time=0.1))
-                best_move = result.move
-                if best_move and board.is_legal(best_move):
-                    callback(best_move.uci())
+                if board.is_game_over():
+                    callback(None)
                 else:
-                    legal_moves = list(board.legal_moves)
-                    callback(random.choice(legal_moves).uci() if legal_moves else None)
-        except Exception as err:
-            print(f"[{game_id}] Engine error: {err}")
-            callback(None)
-        finally:
-            engine_queue.task_done()
+                    # Use a short time-limit but configurable - stronger engine with more resources gives better moves
+                    try:
+                        result = engine.play(board, chess.engine.Limit(time=sf_think_time))
+                    except Exception:
+                        # Fallback to a tiny time or depth
+                        try:
+                            result = engine.play(board, chess.engine.Limit(time=0.1))
+                        except Exception as e:
+                            print(f"[{game_id}] Engine play error: {e}")
+                            callback(None)
+                            continue
+
+                    best_move = result.move
+                    if best_move and board.is_legal(best_move):
+                        callback(best_move.uci())
+                    else:
+                        legal_moves = list(board.legal_moves)
+                        callback(random.choice(legal_moves).uci() if legal_moves else None)
+            except Exception as err:
+                print(f"[{game_id}] Engine error: {err}")
+                callback(None)
+            finally:
+                engine_queue.task_done()
+    finally:
+        # Ensure engines are stopped cleanly
+        try:
+            if fairy_engine:
+                fairy_engine.quit()
+        except Exception:
+            pass
+        try:
+            if normal_engine:
+                normal_engine.quit()
+        except Exception:
+            pass
 
 
 def play_game(game_id, variant_key):
@@ -284,7 +355,7 @@ def handle_challenge(event):
             heuristic_bot = 'bot' in challenger_id.lower()
             challenger_is_bot = challenger_is_bot or heuristic_bot
 
-        print(f"[CHALLENGE] Received from {challenger_name} id={challenger_id} (bot_flag={challenger.get('bot', None)} heuristic={heuristic_bot}) ({variant}, {speed}, {'rated' if rated else 'casual'})")
+        print(f"[CHALLENGE] Received from {challenger_name} id={challenger_id} (bot_flag={challenger.get('bot', None)} heuristic={heuristic_bot}) ({variant}, {speed}, {'rated' if rated else 'casual'})[...]")
 
         # Decline challenges from known/heuristic bots
         if challenger_is_bot:
